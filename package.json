@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Classic Winamp (Webamp) as a Spotify player for macOS, with a real equalizer and visualizer",
   "main": "src/main.cjs",
-  "license": "MIT",
+  "license": "Beerware",
   "author": "alver714",
   "repository": "github:alver714/spotamp",
   "private": true,

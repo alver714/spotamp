@@ -109,4 +109,7 @@ Llama Group or Spotify.
 
 ## License
 
-[MIT](LICENSE)
+[Beerware](LICENSE) (Revision 42). Do whatever you want with this
+stuff; if we meet some day and you think it was worth it, buy me a beer.
+Webamp, librespot and Electron keep their own MIT licenses — see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
