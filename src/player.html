@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Spotamp</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
+      #art {
+        position: fixed; inset: -40px; background: center / cover no-repeat;
+        filter: blur(40px) saturate(1.3) brightness(0.45); transition: background-image 0.6s;
+      }
+      #hint {
+        position: fixed; left: 16px; bottom: 16px; color: #8a93a6;
+        font: 12px/1.4 ui-monospace, Menlo, monospace;
+      }
+      #app { height: 100%; position: relative; }
+
+      /* Widget mode (?widget): transparent background, Winamp windows stacked. */
+      .widget, .widget body { background: transparent; }
+      .widget #art, .widget #hint { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="art"></div>
+    <div id="app"></div>
+    <div id="hint">Connecting to Spotify…</div>
+    <script type="module">
+      import Webamp from "/webamp.mjs";
+
+      const params = new URLSearchParams(location.search);
+      const ENGINE_WS = `ws://127.0.0.1:${params.get("dsp") || 5187}`;
+      const widget = params.has("widget");
+      const native = window.spotamp; // present inside the Electron app
+
+      const hint = document.getElementById("hint");
+      const art = document.getElementById("art");
+      document.documentElement.classList.toggle("widget", widget);
+
+      const webamp = new Webamp({
+        initialTracks: [],
+        ...(widget && {
+          windowLayout: {
+            main: { position: { top: 0, left: 0 } },
+            equalizer: { position: { top: 116, left: 0 } },
+            playlist: { position: { top: 232, left: 0 }, size: { extraHeight: 0, extraWidth: 0 } },
+          },
+        }),
+      });
+      await webamp.renderInto(document.getElementById("app"));
+      const store = webamp.store;
+      window.__webamp = webamp; // for debugging from the console
+
+      // Winamp's close button hides the widget instead of quitting the player.
+      if (widget) webamp.onClose(() => native?.hide());
+
+      // ---------- dragging the widget ----------
+      // The title bars move the whole Electron window. Otherwise Webamp would
+      // move its windows inside it and they'd get clipped at the edge.
+      if (widget && native) {
+        const TITLE_BARS = "#title-bar, .equalizer-top, .playlist-top";
+        document.addEventListener(
+          "pointerdown",
+          (e) => {
+            if (e.button !== 0) return;
+            const bar = e.target.closest?.(TITLE_BARS);
+            if (!bar || e.target.closest("[title]")) return; // title bar buttons
+            e.stopPropagation();
+            e.preventDefault();
+            bar.setPointerCapture(e.pointerId);
+            native.dragStart(e.screenX, e.screenY);
+            const move = (ev) => native.dragMove(ev.screenX, ev.screenY);
+            const up = () => {
+              bar.removeEventListener("pointermove", move);
+              bar.removeEventListener("pointerup", up);
+            };
+            bar.addEventListener("pointermove", move);
+            bar.addEventListener("pointerup", up);
+          },
+          true
+        );
+        // Webamp starts its own drag on mousedown; stop it on the title bars.
+        document.addEventListener(
+          "mousedown",
+          (e) => {
+            if (e.target.closest?.(TITLE_BARS) && !e.target.closest("[title]")) e.stopPropagation();
+          },
+          true
+        );
+      }
+
+      const post = (url, body) =>
+        fetch(url, { method: "POST", body: body && JSON.stringify(body) }).then(async (r) => {
+          if (!r.ok) hint.textContent = await r.text();
+        });
+
+      // ---------- playlist: Liked Songs or a Spotify playlist ----------
+      // These flags tell our own programmatic changes apart from the user's.
+      let syncing = false;
+      let ourSeek = false;
+      let current = null; // the track Spotify is playing
+
+      const bySpotifyId = new Map(); // Spotify track id → track
+      let sourceContext = null;
+      let ready = false; // the first page of the source is in the playlist
+
+      const toWebamp = (t) => ({
+        metaData: { artist: t.artist, title: t.title, album: t.album },
+        url: `/silence.wav?d=${t.duration}&id=${encodeURIComponent(t.id)}`,
+        duration: t.duration,
+      });
+      const spotifyIdOf = (webampTrack) => new URL(webampTrack.url, location.href).searchParams.get("id");
+
+      // Webamp's track id for a Spotify track (the playlist order may change)
+      function webampIdFor(spotifyId) {
+        const { playlist, tracks } = store.getState();
+        return playlist.trackOrder.find((tid) => spotifyIdOf(tracks[tid]) === spotifyId);
+      }
+
+      function addTracks(list, extra = false) {
+        const fresh = list.filter((t) => !bySpotifyId.has(t.id));
+        for (const t of fresh) bySpotifyId.set(t.id, { ...t, extra });
+        if (fresh.length) webamp.appendTracks(fresh.map(toWebamp));
+      }
+
+      // Replaces the Winamp playlist; the track Spotify is playing keeps playing.
+      let loading = 0;
+      async function loadSource(source) {
+        const token = ++loading;
+        ready = false;
+        bySpotifyId.clear();
+        store.dispatch({ type: "STOP" });
+        store.dispatch({ type: "REMOVE_ALL_TRACKS" });
+        current = null; // let sync find the playing track in the new list
+        let offset = 0;
+        while (offset !== null && token === loading) {
+          const r = await fetch(`/api/tracks?source=${encodeURIComponent(source)}&offset=${offset}`);
+          if (!r.ok) throw new Error(await r.text());
+          const page = await r.json();
+          if (token !== loading) return;
+          sourceContext = page.context;
+          addTracks(page.tracks);
+          offset = page.next;
+          if (!ready) (ready = true), sync();
+        }
+      }
+      window.switchSource = (source) =>
+        loadSource(source).catch((err) => (hint.textContent = `Couldn't load the list: ${err.message}`));
+      window.switchSource("liked");
+
+      // ---------- Spotify → Webamp ----------
+      function seekWebamp(t) {
+        ourSeek = true;
+        try {
+          webamp.seekToTime(t);
+        } finally {
+          ourSeek = false;
+        }
+      }
+
+      // Highlight a track in Winamp without sending anything to Spotify.
+      function showTrack(t) {
+        const tid = webampIdFor(t.id);
+        if (tid != null) {
+          syncing = true;
+          webamp.setCurrentTrack(tid);
+          setTimeout(() => (syncing = false), 300);
+        }
+        art.style.backgroundImage = t.artwork ? `url("${t.artwork}")` : "";
+        document.title = `${t.artist} — ${t.title}`;
+      }
+
+      // Pause inside the engine: silence right away, without waiting for Spotify.
+      let held = null;
+      function hold(on) {
+        if (held === on) return;
+        held = on;
+        send({ t: "state", hold: on });
+      }
+
+      // What the user just pressed. Until Spotify catches up, a poll carrying
+      // the old state must not flip the button and the sound back.
+      let want = null; // { state: "playing" | "paused", at }
+      function wantState(state) {
+        want = { state, at: performance.now() };
+        hold(state !== "playing");
+      }
+
+      // After a command, don't wait for the regular once-a-second poll.
+      let commandAt = -Infinity;
+      function afterCommand() {
+        commandAt = performance.now();
+        send({ t: "flush" }); // the rest of the old track in the engine is not needed
+        wantState("playing");
+        for (const ms of [350, 800, 1500]) setTimeout(sync, ms);
+      }
+
+      async function sync() {
+        let s;
+        try {
+          const r = await fetch("/api/now");
+          if (!r.ok) throw new Error(await r.text());
+          s = await r.json();
+        } catch (err) {
+          hint.textContent = err.message;
+          return;
+        }
+        if (s.state === "stopped") {
+          hint.textContent = "Nothing is playing: double-click a track in the playlist";
+          return;
+        }
+
+        if (!ready) return; // the list first, then the track in it
+        // a reply to a request sent before our command is stale
+        if (performance.now() - commandAt < 1200 && s.id !== current?.id) return;
+        if (s.id !== current?.id) {
+          // Switched elsewhere (Spotify app, phone): no flush here. The new track
+          // is already in the engine's buffer, a flush would cut its beginning.
+          if (!bySpotifyId.has(s.id)) addTracks([s], true); // playing something outside the list
+          showTrack(s);
+          current = s;
+        }
+
+        if (want && s.state !== want.state && performance.now() - want.at < 2500) return; // Spotify hasn't caught up
+        want = null;
+        hold(s.state !== "playing");
+        const status = webamp.getMediaStatus();
+        if (s.state === "playing" && status !== "PLAYING") webamp.play();
+        if (s.state === "paused" && status === "PLAYING") webamp.pause();
+        // seeking only works once the silence has loaded (duration is NaN before)
+        if (webamp.getMediaStatus() === "PLAYING" && Math.abs(store.getState().media.timeElapsed - s.position) > 2) {
+          seekWebamp(s.position);
+        }
+        hint.textContent = `${s.artist} — ${s.album}${s.device ? ` · ${s.device}` : ""}`;
+      }
+
+      sync();
+      setInterval(sync, 1000);
+
+      // ---------- Webamp → Spotify ----------
+      // The silence ends together with the track and Webamp moves to the next
+      // row by itself. That isn't the user's command: Spotify leads from here.
+      let nearEnd = false;
+      store.subscribe(() => {
+        const { media, playlist, tracks } = store.getState();
+        const length = tracks[playlist.currentTrack]?.duration;
+        if (length) nearEnd = media.timeElapsed >= length - 1.5;
+      });
+
+      // A double-click in the playlist (or Winamp's hotkeys) changed the track: play it.
+      webamp.onTrackDidChange((track) => {
+        if (syncing || !track || nearEnd) return;
+        const t = bySpotifyId.get(spotifyIdOf(track));
+        if (!t || t.id === current?.id) return;
+        current = { ...t, state: "playing" };
+        afterCommand();
+        post("/api/play-track", { uri: t.uri, context: t.extra ? null : sourceContext });
+      });
+
+      // The neighbouring row in Winamp is where Spotify goes too, via the context.
+      function neighbour(step) {
+        const { playlist, tracks } = store.getState();
+        const i = playlist.trackOrder.indexOf(playlist.currentTrack);
+        const tid = playlist.trackOrder[i + step];
+        return tid != null ? bySpotifyId.get(spotifyIdOf(tracks[tid])) : null;
+      }
+
+      // Transport buttons control Spotify. The Winamp row moves right away
+      // instead of waiting for the reply; the next poll corrects it if needed.
+      // Play/Pause also reach Webamp so its clock runs together with Spotify.
+      document.addEventListener(
+        "click",
+        (e) => {
+          const btn = e.target.closest?.("#webamp #previous, #webamp #next, #webamp #play, #webamp #pause, #webamp #stop");
+          if (!btn) return;
+          if (btn.id === "previous" || btn.id === "next") {
+            e.stopPropagation();
+            // after 3 seconds, "previous" restarts the track in Spotify instead
+            const restart = btn.id === "previous" && store.getState().media.timeElapsed > 3;
+            const t = restart ? null : neighbour(btn.id === "next" ? 1 : -1);
+            if (t) {
+              current = { ...t, state: "playing" };
+              showTrack(t);
+            } else if (restart) {
+              seekWebamp(0);
+            }
+            afterCommand();
+          }
+          if (btn.id === "play") wantState("playing");
+          if (btn.id === "pause") wantState(held ? "playing" : "paused"); // Winamp's Pause toggles
+          if (btn.id === "stop") wantState("paused");
+          post(`/api/cmd/${btn.id === "pause" && want.state === "playing" ? "play" : btn.id}`);
+          if (btn.id !== "previous" && btn.id !== "next") for (const ms of [350, 800, 1500]) setTimeout(sync, ms);
+        },
+        true
+      );
+
+      // Position slider → seek in Spotify.
+      webamp._actionEmitter.on("SEEK_TO_PERCENT_COMPLETE", (action) => {
+        if (ourSeek || !current) return;
+        afterCommand();
+        post(`/api/seek?t=${(action.percent / 100) * current.duration}`);
+      });
+
+      // ---------- engine: volume, equalizer, visualizer ----------
+      let ws = null;
+      const send = (msg) => ws?.readyState === 1 && ws.send(JSON.stringify(msg));
+
+      const sendVolume = () => send({ t: "state", volume: store.getState().media.volume / 100 });
+      const sendEq = () => {
+        const { on, sliders } = store.getState().equalizer;
+        const { preamp, ...bands } = sliders;
+        send({ t: "eq", on, preamp, bands });
+      };
+      let lastVolume, lastEq;
+      store.subscribe(() => {
+        const { media, equalizer } = store.getState();
+        if (media.volume !== lastVolume) (lastVolume = media.volume), sendVolume();
+        if (equalizer !== lastEq) (lastEq = equalizer), sendEq();
+      });
+
+      // Webamp's visualizer draws whatever its analyser sees. We feed the analyser
+      // the engine's final output (after the equalizer); nothing goes to the speakers here.
+      const media = webamp.media;
+      const FEED = `
+        class Feed extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.q = [];
+            this.off = 0;
+            this.port.onmessage = (e) => {
+              this.q.push(e.data);
+              if (this.q.length > 12) this.q.splice(0, this.q.length - 4); // don't build up latency
+            };
+          }
+          process(_, outputs) {
+            const [L, R] = outputs[0];
+            for (let i = 0; i < L.length; i++) {
+              while (this.q.length && this.off * 2 >= this.q[0].length) { this.q.shift(); this.off = 0; }
+              if (!this.q.length) { L[i] = R[i] = 0; continue; }
+              const b = this.q[0];
+              L[i] = b[this.off * 2] / 32768;
+              R[i] = b[this.off * 2 + 1] / 32768;
+              this.off++;
+            }
+            return true;
+          }
+        }
+        registerProcessor("pcm-feed", Feed);`;
+      await media._context.audioWorklet.addModule(URL.createObjectURL(new Blob([FEED], { type: "text/javascript" })));
+      const feed = new AudioWorkletNode(media._context, "pcm-feed", { outputChannelCount: [2] });
+      feed.connect(media._analyser);
+
+      function connectEngine() {
+        ws = new WebSocket(ENGINE_WS);
+        ws.binaryType = "arraybuffer";
+        ws.onopen = () => {
+          held = null; // the engine may have restarted: the next sync re-sends hold
+          sendVolume();
+          sendEq();
+        };
+        ws.onmessage = (e) => {
+          if (typeof e.data !== "string") feed.port.postMessage(new Int16Array(e.data), []);
+        };
+        ws.onclose = () => setTimeout(connectEngine, 2000);
+      }
+      connectEngine();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,49 @@
+{
+  "name": "spotamp",
+  "version": "0.1.0",
+  "description": "Classic Winamp (Webamp) as a Spotify player for macOS, with a real equalizer and visualizer",
+  "main": "src/main.cjs",
+  "license": "MIT",
+  "author": "alver714",
+  "repository": "github:alver714/spotamp",
+  "private": true,
+  "scripts": {
+    "vendor": "scripts/vendor.sh",
+    "start": "electron .",
+    "dist": "npm run vendor && electron-builder --mac dmg --arm64"
+  },
+  "dependencies": {
+    "webamp": "2.3.1"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "io.github.alver714.spotamp",
+    "productName": "Spotamp",
+    "files": [
+      "src/**",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "engine", "to": "engine" },
+      { "from": "vendor/bin", "to": "vendor/bin" },
+      { "from": "LICENSE", "to": "LICENSE" },
+      { "from": "THIRD_PARTY_NOTICES.md", "to": "THIRD_PARTY_NOTICES.md" }
+    ],
+    "mac": {
+      "category": "public.app-category.music",
+      "icon": "assets/icon.icns",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "extendInfo": {
+        "LSUIElement": true
+      }
+    },
+    "dmg": {
+      "title": "Spotamp",
+      "artifactName": "Spotamp-${version}-arm64.dmg"
+    }
+  }
+}

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Set up Spotamp</title>
+    <style>
+      :root {
+        --bg: #1b1e27; --panel: #252a37; --line: #343a4b; --fg: #e6e8ee; --muted: #9aa1b2;
+        --lcd: #00e85b; --accent: #f2c14e;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; background: var(--bg); color: var(--fg); }
+      body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 28px 32px; }
+      h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: 0.01em; }
+      .lead { color: var(--muted); margin: 0 0 22px; }
+      ol { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+      li { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; }
+      li.done { opacity: 0.6; }
+      .head { display: flex; gap: 10px; align-items: baseline; }
+      .n { font: 600 12px ui-monospace, Menlo, monospace; color: var(--accent); min-width: 1.5em; }
+      .ok { margin-left: auto; color: var(--lcd); font-weight: 600; }
+      h2 { font-size: 14px; margin: 0; }
+      p { margin: 6px 0 0 2.1em; color: var(--muted); }
+      .body { margin: 10px 0 0 2.1em; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      code, input { font: 12.5px ui-monospace, Menlo, monospace; }
+      code { background: #12141a; border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; user-select: all; }
+      input { flex: 1; min-width: 0; background: #12141a; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 7px 8px; }
+      button {
+        font: 600 13px -apple-system, sans-serif; color: #111; background: var(--accent);
+        border: 0; border-radius: 4px; padding: 7px 12px; cursor: pointer;
+      }
+      button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+      button:disabled { opacity: 0.4; cursor: default; }
+      button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .err { color: #ff7b72; margin: 6px 0 0 2.1em; min-height: 1.2em; }
+      footer { margin-top: 18px; display: flex; justify-content: flex-end; }
+    </style>
+  </head>
+  <body>
+    <h1>Set up Spotamp</h1>
+    <p class="lead">Spotamp plays through your own Spotify app. This takes about two minutes, once. Spotify Premium is required.</p>
+    <ol>
+      <li id="s1">
+        <div class="head"><span class="n">1</span><h2>Create a Spotify app</h2><span class="ok" hidden>✓</span></div>
+        <p>In the Spotify Developer Dashboard, create an app with any name. Under <b>Redirect URIs</b> add the address below, and tick <b>Web API</b>.</p>
+        <div class="body">
+          <code id="redirect">http://127.0.0.1:5174/callback</code>
+          <button class="ghost" id="copy">Copy</button>
+          <button class="ghost" id="dashboard">Open Dashboard</button>
+        </div>
+      </li>
+      <li id="s2">
+        <div class="head"><span class="n">2</span><h2>Paste the app's Client ID</h2><span class="ok" hidden>✓</span></div>
+        <div class="body">
+          <input id="client" placeholder="32 characters, from the app's Basic Information page" spellcheck="false" autocomplete="off" />
+          <button id="save">Save</button>
+        </div>
+        <div class="err" id="clientErr"></div>
+      </li>
+      <li id="s3">
+        <div class="head"><span class="n">3</span><h2>Sign in to Spotify</h2><span class="ok" hidden>✓</span></div>
+        <p>Lets Spotamp read your playlists and control playback.</p>
+        <div class="body"><button id="login" disabled>Sign in</button></div>
+      </li>
+      <li id="s4">
+        <div class="head"><span class="n">4</span><h2>Connect the player</h2><span class="ok" hidden>✓</span></div>
+        <p>Spotamp plays sound as its own Spotify Connect device, “Spotamp”. It asks Spotify to sign in once more, for that device.</p>
+        <div class="body"><button id="engine" disabled>Connect</button><span id="engineState"></span></div>
+        <div class="err" id="engineErr"></div>
+      </li>
+    </ol>
+    <footer><button id="done" disabled>Open Spotamp</button></footer>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const open = (url) => window.spotamp?.openUrl(url);
+
+      $("copy").onclick = async () => {
+        try {
+          await navigator.clipboard.writeText($("redirect").textContent);
+          $("copy").textContent = "Copied";
+        } catch {
+          getSelection().selectAllChildren($("redirect"));
+        }
+      };
+      $("dashboard").onclick = () => open("https://developer.spotify.com/dashboard");
+      $("save").onclick = async () => {
+        $("clientErr").textContent = "";
+        const r = await fetch("/api/client-id", { method: "POST", body: JSON.stringify({ clientId: $("client").value.trim() }) });
+        if (!r.ok) $("clientErr").textContent = await r.text();
+        refresh();
+      };
+      $("login").onclick = () => open(`${location.origin}/login`);
+      $("engine").onclick = () => {
+        window.spotamp?.startEngine();
+        $("engine").disabled = true;
+      };
+      $("done").onclick = () => window.spotamp?.setupDone();
+
+      const mark = (id, done) => {
+        $(id).classList.toggle("done", done);
+        $(id).querySelector(".ok").hidden = !done;
+      };
+
+      async function refresh() {
+        const s = await (await fetch("/api/setup")).json();
+        $("redirect").textContent = s.redirectUri;
+        if (s.clientId && document.activeElement !== $("client")) $("client").value = s.clientId;
+        mark("s1", !!s.clientId);
+        mark("s2", !!s.clientId);
+        mark("s3", s.signedIn);
+        $("login").disabled = !s.clientId;
+        const engineOk = s.engine.signedIn;
+        mark("s4", engineOk);
+        $("engine").disabled = !s.signedIn || engineOk || s.engine.state === "signing-in";
+        $("engineState").textContent =
+          s.engine.state === "signing-in" ? "Waiting for the browser…" : engineOk ? "Connected" : "";
+        $("engineErr").textContent = s.engine.error || "";
+        $("done").disabled = !(s.signedIn && engineOk);
+      }
+      refresh();
+      setInterval(refresh, 1000);
+    </script>
+  </body>
+</html>
